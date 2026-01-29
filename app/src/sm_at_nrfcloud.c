@@ -15,6 +15,7 @@
 #include <net/nrf_cloud_location.h>
 #include <modem/at_parser.h>
 #include <modem/nrf_modem_lib.h>
+#include <modem/lte_lc.h>
 #include "sm_util.h"
 #include "sm_at_host.h"
 #include "sm_at_nrfcloud.h"
@@ -67,13 +68,13 @@ BUILD_ASSERT(NCELL_CNT > 0, "CONFIG_SM_AT_MAX_PARAM too small");
 
 /* Neighboring cell measurements. */
 static struct lte_lc_ncell nrfcloud_ncells[NCELL_CNT];
+static struct lte_lc_cell gci_cells[10];
 
 /* nRF Cloud location request cellular data. */
 static struct lte_lc_cells_info nrfcloud_cell_data = {
 	.neighbor_cells = nrfcloud_ncells,
-	.gci_cells_count = 0
+	.gci_cells = gci_cells
 };
-static bool nrfcloud_ncellmeas_done;
 
 #define WIFI_APS_BEGIN_IDX 3
 BUILD_ASSERT(WIFI_APS_BEGIN_IDX + NRF_CLOUD_LOCATION_WIFI_AP_CNT_MIN
@@ -90,171 +91,217 @@ bool sm_nrf_cloud_ready;
 bool sm_nrf_cloud_send_location;
 
 #if defined(CONFIG_NRF_CLOUD_LOCATION)
-AT_MONITOR(ncell_meas, "NCELLMEAS", ncell_meas_mon, PAUSED);
 
-static void ncell_meas_mon(const char *notify)
+/**
+ * Waiting time (in seconds) of RRC connection going into idle mode. Because GCI search
+ * cannot scan GCI cells during RRC connected mode, we will wait for the RRC idle mode before
+ * initiating GCI search.
+ */
+#define SCAN_CELLULAR_RRC_IDLE_WAIT_TIME 10
+
+static volatile bool timeout_occurred;
+/* Indicates when individual ncellmeas operation is completed. This is internal to this file. */
+static struct k_sem scan_cellular_sem_ncellmeas_evt;
+
+/** Semaphore for waiting for RRC idle mode. */
+static K_SEM_DEFINE(entered_rrc_idle, 1, 1);
+
+/**
+ * Handler for backup timeout, which ensures we won't be waiting for LTE_LC_EVT_NEIGHBOR_CELL_MEAS
+ * event forever after lte_lc_neighbor_cell_measurement_cancel() in case it would never be sent.
+ */
+static void scan_cellular_timeout_backup_work_fn(struct k_work *work);
+
+/** Work item for backup timeout handler. */
+K_WORK_DELAYABLE_DEFINE(scan_cellular_timeout_backup_work, scan_cellular_timeout_backup_work_fn);
+
+void scan_cellular_lte_ind_handler(const struct lte_lc_evt *const evt)
 {
+	switch (evt->type) {
+	case LTE_LC_EVT_NEIGHBOR_CELL_MEAS: {
+		if (!nrfcloud_sending_loc_req) {
+			return;
+		}
+		LOG_DBG("Cell measurements results received: "
+			"ncells_count=%d, gci_cells_count=%d, current_cell.id=0x%08X",
+			evt->cells_info.ncells_count,
+			evt->cells_info.gci_cells_count,
+			evt->cells_info.current_cell.id);
+
+		if (evt->cells_info.current_cell.id != LTE_LC_CELL_EUTRAN_ID_INVALID) {
+			/* Copy current cell information. We are seeing this is not set for GCI
+			 * search sometimes but we have it for the previous normal neighbor search.
+			 */
+			memcpy(&nrfcloud_cell_data.current_cell,
+			       &evt->cells_info.current_cell,
+			       sizeof(struct lte_lc_cell));
+		}
+
+		/* Copy neighbor cell information if present */
+		if (evt->cells_info.ncells_count > 0 && evt->cells_info.neighbor_cells) {
+			memcpy(nrfcloud_cell_data.neighbor_cells,
+			       evt->cells_info.neighbor_cells,
+			       sizeof(struct lte_lc_ncell) * evt->cells_info.ncells_count);
+
+			nrfcloud_cell_data.ncells_count = evt->cells_info.ncells_count;
+		} else {
+			LOG_DBG("No neighbor cell information from modem");
+		}
+
+		/* Copy surrounding cell information if present */
+		if (evt->cells_info.gci_cells_count > 0 && evt->cells_info.gci_cells) {
+			memcpy(nrfcloud_cell_data.gci_cells,
+			       evt->cells_info.gci_cells,
+			       sizeof(struct lte_lc_cell) * evt->cells_info.gci_cells_count);
+
+			nrfcloud_cell_data.gci_cells_count = evt->cells_info.gci_cells_count;
+		} else {
+			LOG_DBG("No surrounding cell information from modem");
+		}
+
+		k_sem_give(&scan_cellular_sem_ncellmeas_evt);
+	} break;
+	case LTE_LC_EVT_RRC_UPDATE:
+		if (evt->rrc_mode == LTE_LC_RRC_MODE_CONNECTED) {
+			/* Prevent GCI search while RRC is in connected mode. */
+			k_sem_reset(&entered_rrc_idle);
+		} else if (evt->rrc_mode == LTE_LC_RRC_MODE_IDLE) {
+			/* Allow GCI search operation once RRC is in idle mode. */
+			k_sem_give(&entered_rrc_idle);
+		}
+		break;
+	default:
+		break;
+	}
+}
+
+static void scan_cellular_execute(uint8_t cell_count)
+{
+	struct lte_lc_ncellmeas_params ncellmeas_params = {
+		.search_type = LTE_LC_NEIGHBOR_SEARCH_TYPE_EXTENDED_LIGHT,
+		.gci_count = 0
+	};
 	int err;
-	uint32_t param_count;
-	int ncellmeas_status;
-	char cid[9] = {0};
-	size_t size;
-	char plmn[6] = {0};
-	char mcc[4]  = {0};
-	char tac[9] = {0};
-	unsigned int ncells_count = 0;
-	struct at_parser parser;
+	uint8_t ncellmeas3_cell_count;
 
-	nrfcloud_ncellmeas_done = false;
-	err = at_parser_init(&parser, notify);
+	timeout_occurred = false;
+	nrfcloud_cell_data.current_cell.id = LTE_LC_CELL_EUTRAN_ID_INVALID;
+	nrfcloud_cell_data.ncells_count = 0;
+	nrfcloud_cell_data.gci_cells_count = 0;
+
+	/* Start backup timeout for 120 seconds to handle missing NCELLMEAS notification. */
+	k_work_schedule(&scan_cellular_timeout_backup_work, K_SECONDS(120));
+
+	LOG_DBG("Triggering cell measurements cell_count=%d", cell_count);
+
+	/*****
+	 * 1st: Normal neighbor search to get current cell.
+	 *      In addition neighbor cells are received.
+	 */
+	LOG_DBG("Normal neighbor search (NCELLMEAS=1)");
+	err = lte_lc_neighbor_cell_measurement(&ncellmeas_params);
 	if (err) {
-		goto exit;
+		LOG_ERR("Failed to initiate neighbor cell measurements: %d", err);
+		goto end;
 	}
-
-	/* parse status, 0: success 1: fail */
-	err = at_parser_num_get(&parser, 1, &ncellmeas_status);
+	err = k_sem_take(&scan_cellular_sem_ncellmeas_evt, K_FOREVER);
 	if (err) {
-		goto exit;
-	}
-	if (ncellmeas_status != 0) {
-		LOG_ERR("NCELLMEAS failed");
-		err = -EAGAIN;
-		goto exit;
+		/* Semaphore was reset so stop search procedure */
+		err = 0;
+		goto end;
 	}
 
-	err = at_parser_cmd_count_get(&parser, &param_count);
-	if (err) {
-		goto exit;
-	}
-	if (param_count < MAX_PARAM_CELL) { /* at least current cell */
-		LOG_ERR("Missing param in NCELLMEAS notification");
-		err = -EAGAIN;
-		goto exit;
+	/* If no more than 1 cell is requested, don't perform GCI searches */
+	if (cell_count <= 1) {
+		goto end;
 	}
 
-	/* parse Cell ID */
-	size = sizeof(cid);
-	err = util_string_get(&parser, 2, cid, &size);
-	if (err) {
-		goto exit;
-	}
-	err = util_str_to_int(cid, 16, (int *)&nrfcloud_cell_data.current_cell.id);
-	if (err) {
-		goto exit;
-	}
+	/* GCI searches are not done when in RRC connected mode. We are waiting for
+	 * device to enter RRC idle mode unless it's there already.
+	 */
+	LOG_DBG("%s", k_sem_count_get(&entered_rrc_idle) == 0 ?
+		"Waiting for the RRC connection release..." :
+		"RRC already in idle mode");
 
-	/* parse PLMN */
-	size = sizeof(plmn);
-	err = util_string_get(&parser, 3, plmn, &size);
-	if (err) {
-		goto exit;
-	}
-	strncpy(mcc, plmn, 3); /* MCC always 3-digit */
-	err = util_str_to_int(mcc, 10, &nrfcloud_cell_data.current_cell.mcc);
-	if (err) {
-		goto exit;
-	}
-	err = util_str_to_int(&plmn[3], 10, &nrfcloud_cell_data.current_cell.mnc);
-	if (err) {
-		goto exit;
-	}
-
-	/* parse TAC */
-	size = sizeof(tac);
-	err = util_string_get(&parser, 4, tac, &size);
-	if (err) {
-		goto exit;
-	}
-	err = util_str_to_int(tac, 16, (int *)&nrfcloud_cell_data.current_cell.tac);
-	if (err) {
-		goto exit;
-	}
-
-	/* omit timing_advance */
-	nrfcloud_cell_data.current_cell.timing_advance = NRF_CLOUD_LOCATION_CELL_OMIT_TIME_ADV;
-
-	/* parse EARFCN */
-	err = at_parser_num_get(&parser, 6, &nrfcloud_cell_data.current_cell.earfcn);
-	if (err) {
-		goto exit;
-	}
-
-	/* parse PCI */
-	err = at_parser_num_get(&parser, 7,
-				&nrfcloud_cell_data.current_cell.phys_cell_id);
-	if (err) {
-		goto exit;
-	}
-
-	/* parse RSRP and RSRQ */
-	err = at_parser_num_get(&parser, 8, &nrfcloud_cell_data.current_cell.rsrp);
-	if (err < 0) {
-		goto exit;
-	}
-	err = at_parser_num_get(&parser, 9, &nrfcloud_cell_data.current_cell.rsrq);
-	if (err < 0) {
-		goto exit;
-	}
-
-	/* omit measurement_time and parse neighboring cells */
-
-	ncells_count = (param_count - MAX_PARAM_CELL) / MAX_PARAM_NCELL;
-	for (unsigned int i = 0; i != ncells_count; ++i) {
-		const unsigned int offset = MAX_PARAM_CELL + i * MAX_PARAM_NCELL;
-
-		/* parse n_earfcn */
-		err = at_parser_num_get(&parser, offset, &nrfcloud_ncells[i].earfcn);
-		if (err < 0) {
-			goto exit;
+	if (k_sem_take(&entered_rrc_idle, K_SECONDS(SCAN_CELLULAR_RRC_IDLE_WAIT_TIME)) != 0) {
+		/* If semaphore is reset while waiting, the position request was canceled */
+		if (!nrfcloud_sending_loc_req) {
+			goto end;
 		}
+		/* The wait for RRC idle timed out */
+		LOG_WRN("RRC connection was not released in %d seconds.",
+			SCAN_CELLULAR_RRC_IDLE_WAIT_TIME);
+		goto end;
+	}
+	k_sem_give(&entered_rrc_idle);
 
-		/* parse n_phys_cell_id */
-		err = at_parser_num_get(&parser, offset + 1,
-					&nrfcloud_ncells[i].phys_cell_id);
-		if (err < 0) {
-			goto exit;
-		}
+	/*****
+	 * 2nd: GCI history search to get GCI cells we can quickly search and measure.
+	 *      Because history search is quick and very power efficient, we request
+	 *      minimum of 5 cells even if less has been requested.
+	 */
+	ncellmeas3_cell_count = MAX(5, cell_count);
+	LOG_DBG("GCI history search (NCELLMEAS=3,%d)", ncellmeas3_cell_count);
 
-		/* parse n_rsrp */
-		err = at_parser_num_get(&parser, offset + 2, &nrfcloud_ncells[i].rsrp);
-		if (err < 0) {
-			goto exit;
-		}
+	ncellmeas_params.search_type = LTE_LC_NEIGHBOR_SEARCH_TYPE_GCI_DEFAULT;
+	ncellmeas_params.gci_count = ncellmeas3_cell_count;
 
-		/* parse n_rsrq */
-		err = at_parser_num_get(&parser, offset + 3, &nrfcloud_ncells[i].rsrq);
-		if (err < 0) {
-			goto exit;
-		}
-		/* omit time_diff */
+	err = lte_lc_neighbor_cell_measurement(&ncellmeas_params);
+	if (err) {
+		LOG_WRN("Failed to initiate GCI cell measurements: %d", err);
+		/* Clearing 'err' because previous neighbor search has succeeded
+		 * so those are still valid and positioning can proceed with that data
+		 */
+		err = 0;
+		goto end;
+	}
+	err = k_sem_take(&scan_cellular_sem_ncellmeas_evt, K_FOREVER);
+	if (err) {
+		/* Semaphore was reset so stop search procedure */
+		err = 0;
+		goto end;
 	}
 
-	err = 0;
-	nrfcloud_cell_data.ncells_count = ncells_count;
-	nrfcloud_ncellmeas_done = true;
+	/* If we received already enough GCI cells including current cell */
+	if (nrfcloud_cell_data.gci_cells_count + 1 >= cell_count) {
+		goto end;
+	}
 
-exit:
-	LOG_INF("NCELLMEAS notification parse (err: %d)", err);
+	/*****
+	 * 3rd: GCI regional search to try and get requested number of GCI cells.
+	 *      This search can be time and power consuming especially in rural areas
+	 *      depending on the available bands in the region.
+	 */
+	LOG_DBG("GCI regional search (NCELLMEAS=4,%d)", cell_count);
+	ncellmeas_params.search_type = LTE_LC_NEIGHBOR_SEARCH_TYPE_GCI_EXTENDED_LIGHT;
+	ncellmeas_params.gci_count = cell_count;
+
+	err = lte_lc_neighbor_cell_measurement(&ncellmeas_params);
+	if (err) {
+		LOG_WRN("Failed to initiate GCI cell measurements: %d", err);
+		/* Clearing 'err' because previous neighbor search has succeeded
+		 * so those are still valid and positioning can proceed with that data
+		 */
+		err = 0;
+		goto end;
+	}
+	k_sem_take(&scan_cellular_sem_ncellmeas_evt, K_FOREVER);
+
+end:
+	k_work_cancel_delayable(&scan_cellular_timeout_backup_work);
+	k_work_submit_to_queue(&sm_work_q, &nrfcloud_loc_req);
+}
+
+static void scan_cellular_timeout_backup_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	k_sem_reset(&scan_cellular_sem_ncellmeas_evt);
 }
 
 static void loc_req_wk(struct k_work *work)
 {
 	int err = 0;
-
-	if (nrfcloud_cell_pos == CELLPOS_SINGLE_CELL) {
-		/* Obtain the single cell info from the modem */
-		err = nrf_cloud_location_scell_data_get(&nrfcloud_cell_data.current_cell);
-		if (err) {
-			LOG_ERR("Failed to obtain single-cell cellular network information (%d).",
-				err);
-		} else {
-			nrfcloud_cell_data.ncells_count = 0;
-			/* Invalidate the last neighboring cell measurements
-			 * because they have been partly overwritten.
-			 */
-			nrfcloud_ncellmeas_done = false;
-		}
-	}
 
 	if (!err) {
 		err = nrf_cloud_location_request(
@@ -300,18 +347,12 @@ static void on_cloud_evt_ready(void)
 {
 	sm_nrf_cloud_ready = true;
 	rsp_send("\r\n#XNRFCLOUD: %d,%d\r\n", sm_nrf_cloud_ready, sm_nrf_cloud_send_location);
-#if defined(CONFIG_NRF_CLOUD_LOCATION)
-	at_monitor_resume(&ncell_meas);
-#endif
 }
 
 static void on_cloud_evt_disconnected(void)
 {
 	sm_nrf_cloud_ready = false;
 	rsp_send("\r\n#XNRFCLOUD: %d,%d\r\n", sm_nrf_cloud_ready, sm_nrf_cloud_send_location);
-#if defined(CONFIG_NRF_CLOUD_LOCATION)
-	at_monitor_pause(&ncell_meas);
-#endif
 }
 
 static void on_cloud_evt_location_data_received(const struct nrf_cloud_data *const data)
@@ -655,7 +696,7 @@ static int handle_at_nrf_cloud_pos(enum at_parser_cmd_type cmd_type,
 		return err;
 	}
 
-	if (cell_pos >= CELLPOS_COUNT || wifi_pos > 1) {
+	if (cell_pos > 10 || wifi_pos > 1) {
 		return -EINVAL;
 	}
 
@@ -664,10 +705,10 @@ static int handle_at_nrf_cloud_pos(enum at_parser_cmd_type cmd_type,
 		return -EINVAL;
 	}
 
-	if (cell_pos == CELLPOS_MULTI_CELL && !nrfcloud_ncellmeas_done) {
+	/*if (cell_pos == CELLPOS_MULTI_CELL && !nrfcloud_ncellmeas_done) {
 		LOG_ERR("%s", "No neighboring cell measurement. Did you run `AT%NCELLMEAS`?");
 		return -EAGAIN;
-	}
+	}*/
 
 	if (!wifi_pos && param_count > WIFI_APS_BEGIN_IDX) {
 		/* No Wi-Fi AP allowed if no Wi-Fi positioning. */
@@ -749,7 +790,7 @@ static int handle_at_nrf_cloud_pos(enum at_parser_cmd_type cmd_type,
 	nrfcloud_wifi_pos = wifi_pos;
 
 	nrfcloud_sending_loc_req = true;
-	k_work_submit_to_queue(&sm_work_q, &nrfcloud_loc_req);
+	scan_cellular_execute(cell_pos);
 	return 0;
 }
 
@@ -777,6 +818,8 @@ static void sm_at_nrfcloud_init(int ret, void *ctx)
 	k_work_init(&cloud_cmd, cloud_cmd_wk);
 #if defined(CONFIG_NRF_CLOUD_LOCATION)
 	k_work_init(&nrfcloud_loc_req, loc_req_wk);
+	lte_lc_register_handler(scan_cellular_lte_ind_handler);
+	k_sem_init(&scan_cellular_sem_ncellmeas_evt, 0, 1);
 #endif
 	nrf_cloud_client_id_get(nrfcloud_device_id, sizeof(nrfcloud_device_id));
 }
