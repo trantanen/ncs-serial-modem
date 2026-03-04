@@ -70,6 +70,8 @@ STATIC int handle_at_smver(enum at_parser_cmd_type cmd_type, struct at_parser *,
 {
 	int ret = -EINVAL;
 
+	printf("handle_at_smver\n");
+
 	if (cmd_type == AT_PARSER_CMD_TYPE_SET) {
 		if (strlen(CONFIG_SM_CUSTOMER_VERSION) > 0) {
 			rsp_send("\r\n#XSMVER: %s,%s,\"%s\"\r\n",
