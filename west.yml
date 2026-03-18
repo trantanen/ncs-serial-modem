@@ -29,3 +29,6 @@ manifest:
           - trusted-firmware-m
           - zcbor
           - zephyr
+          #- openthread
+          #- azure-sdk-for-c
+          #- matter
