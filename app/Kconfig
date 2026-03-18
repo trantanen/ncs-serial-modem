@@ -237,7 +237,7 @@ config SM_DATAMODE_BUF_SIZE
 config SM_SMS
 	bool "SMS support"
 	default y
-	select SMS
+	select SMS if UNKNOWN_KCONFIG
 	help
 	  Support SMS send/receive in plain text
 

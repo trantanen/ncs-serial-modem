@@ -44,7 +44,7 @@ static struct nrf_modem_fault_info modem_fault_info;
 static void on_modem_failure(struct k_work *)
 {
 	int ret;
-	struct modem_pipe *pipe = sm_at_host_get_urc_pipe();
+	struct modem_pipe *pipe = sm_at_host_get_urc_pipe(); /* COMMENT JUST TO MAKE TOO LONG LINE FOR TESTING */
 
 	urc_send_to(pipe, "\r\n#XMODEM: FAULT,0x%x,0x%x\r\n", modem_fault_info.reason, /* ANOTHER LONG LINE FOR TESTING */
 		    modem_fault_info.program_counter);
