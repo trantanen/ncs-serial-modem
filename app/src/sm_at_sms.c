@@ -65,6 +65,98 @@ static void sms_concat_cleanup_work_fn(struct k_work *work)
 	LOG_INF("Concat msg timed out, ref_number %u", ctx->ref_number);
 }
 
+static void sms_concat_handle(struct sms_data *const data)
+{
+	struct sms_deliver_header *header = &data->header.deliver;
+
+	LOG_DBG("Concat msg %d, %d, %d",
+		header->concatenated.ref_number,
+		header->concatenated.total_msgs,
+		header->concatenated.seq_number);
+
+	/* ref_number and total_msgs should remain unchanged.
+	 * If they are different, this is a different concatenated message
+	 * and we discard the current and try with the new message.
+	 * We may end up in changing from one message to another one if two
+	 * concatenated messages are received at the same time in mixed order.
+	 */
+	if (sms_ctx.ref_number != 0 && sms_ctx.ref_number != header->concatenated.ref_number) {
+		LOG_ERR("Concat msg ref_number error: %d, %d",
+			sms_ctx.ref_number, header->concatenated.ref_number);
+		sms_concat_clear(&sms_ctx);
+	}
+	if (sms_ctx.ref_number == 0) {
+		sms_ctx.ref_number = header->concatenated.ref_number;
+		
+		if (header->concatenated.total_msgs > MAX_CONCATENATED_MESSAGE) {
+			LOG_ERR("Concat msg limited to %d, received: %d",
+				MAX_CONCATENATED_MESSAGE, header->concatenated.total_msgs);
+			goto done;
+		}
+
+		/* Allocate buffer for concatenated message. The allocation
+		 * size is an upper boundary as headers and last message part
+		 * are slightly less in practice.
+		 */
+		uint16_t concat_msg_len =
+			SM_SMS_AT_HEADER_INFO_MAX_LEN +
+			SMS_MAX_PAYLOAD_LEN_CHARS * header->concatenated.total_msgs;
+		sms_ctx.concat_rsp_buf = malloc(concat_msg_len);
+		if (sms_ctx.concat_rsp_buf == NULL) {
+			LOG_ERR("Concat msg no memory for %d bytes, %d messages",
+				concat_msg_len, header->concatenated.total_msgs);
+			goto done;
+		}
+		memset(sms_ctx.concat_rsp_buf, 0, concat_msg_len);
+	}
+	if (sms_ctx.total_msgs == 0) {
+		sms_ctx.total_msgs = header->concatenated.total_msgs;
+	}
+	if (sms_ctx.total_msgs != header->concatenated.total_msgs) {
+		LOG_ERR("Concat msg total_msgs error: %d, %d",
+			sms_ctx.total_msgs, header->concatenated.total_msgs);
+		goto done;
+	}
+	/* seq_number should start with 1 but could arrive in random order */
+	if (header->concatenated.seq_number == 0 ||
+	    header->concatenated.seq_number > sms_ctx.total_msgs) {
+		LOG_ERR("Concat msg seq_number error: %d, %d",
+			header->concatenated.seq_number, sms_ctx.total_msgs);
+		goto done;
+	}
+	if (header->concatenated.seq_number == 1) {
+		sprintf(sms_ctx.concat_rsp_buf,
+			"\r\n#XSMS: \"%02d-%02d-%02d %02d:%02d:%02d\",\"%s\",\"%s",
+			header->time.year, header->time.month, header->time.day,
+			header->time.hour, header->time.minute,	header->time.second,
+			header->originating_address.address_str,
+			data->payload);
+	} else {
+		strcpy(sms_ctx.concat_rsp_buf + SM_SMS_AT_HEADER_INFO_MAX_LEN +
+		       (header->concatenated.seq_number - 1) * SMS_MAX_PAYLOAD_LEN_CHARS,
+		       data->payload);
+	}
+	sms_ctx.count++;
+	if (sms_ctx.count == sms_ctx.total_msgs) {
+		for (int i = 1; i < (sms_ctx.total_msgs); i++) {
+			strncat(sms_ctx.concat_rsp_buf,
+				sms_ctx.concat_rsp_buf + SM_SMS_AT_HEADER_INFO_MAX_LEN +
+				i * SMS_MAX_PAYLOAD_LEN_CHARS,
+				SMS_MAX_PAYLOAD_LEN_CHARS);
+		}
+		strcat(sms_ctx.concat_rsp_buf, "\"\r\n");
+		urc_send_to(sms_ctx.pipe, "%s", sms_ctx.concat_rsp_buf);
+	} else {
+		/* If new messages for the concatenated message are not receivied
+		 * within 3 minutes, discard the concatenated message.
+		 */
+		(void)k_work_reschedule(&sms_ctx.cleanup_work, MAX_CONCATENATED_MESSAGE_AGE);
+		return;
+	}
+done:
+	sms_concat_clear(&sms_ctx);
+}
+
 static void sms_callback(struct sms_data *const data, void *context)
 {
 	ARG_UNUSED(context);
@@ -86,97 +178,7 @@ static void sms_callback(struct sms_data *const data, void *context)
 				abs(header->time.timezone) * 15 % 60,
 				header->originating_address.address_str, data->payload);
 		} else {
-			LOG_DBG("Concat msg %d, %d, %d",
-				header->concatenated.ref_number,
-				header->concatenated.total_msgs,
-				header->concatenated.seq_number);
-
-			/* ref_number and total_msgs should remain unchanged.
-			 * If they are different, this is a different concatenated message
-			 * and we discard the current and try with the new message.
-			 * We may end up in changing from one message to another one if two
-			 * concatenated messages are received at the same time in mixed order.
-			 */
-			if (sms_ctx.ref_number != 0 &&
-			    sms_ctx.ref_number != header->concatenated.ref_number) {
-				LOG_ERR("Concat msg ref_number error: %d, %d",
-					sms_ctx.ref_number, header->concatenated.ref_number);
-				sms_concat_clear(&sms_ctx);
-			}
-			if (sms_ctx.ref_number == 0) {
-				sms_ctx.ref_number = header->concatenated.ref_number;
-				
-				if (header->concatenated.total_msgs > MAX_CONCATENATED_MESSAGE) {
-					LOG_ERR("Concat msg limited to %d, received: %d",
-						MAX_CONCATENATED_MESSAGE, header->concatenated.total_msgs);
-					goto done;
-				}
-	
-				/* Allocate buffer for concatenated message. The allocation
-				 * size is an upper boundary as headers and last message part
-				 * are slightly less in practice.
-				 */
-				uint16_t concat_msg_len =
-					SM_SMS_AT_HEADER_INFO_MAX_LEN +
-					SMS_MAX_PAYLOAD_LEN_CHARS * header->concatenated.total_msgs;
-				sms_ctx.concat_rsp_buf = malloc(concat_msg_len);
-				if (sms_ctx.concat_rsp_buf == NULL) {
-					LOG_ERR("Concat msg no memory for "
-						"%d bytes, %d messages",
-						concat_msg_len,
-						header->concatenated.total_msgs);
-					goto done;
-				}
-				memset(sms_ctx.concat_rsp_buf, 0, concat_msg_len);
-			}
-			if (sms_ctx.total_msgs == 0) {
-				sms_ctx.total_msgs = header->concatenated.total_msgs;
-			}
-			if (sms_ctx.total_msgs != header->concatenated.total_msgs) {
-				LOG_ERR("Concat msg total_msgs error: %d, %d",
-					sms_ctx.total_msgs, header->concatenated.total_msgs);
-				goto done;
-			}
-			/* seq_number should start with 1 but could arrive in random order */
-			if (header->concatenated.seq_number == 0 ||
-			    header->concatenated.seq_number > sms_ctx.total_msgs) {
-				LOG_ERR("Concat msg seq_number error: %d, %d",
-					header->concatenated.seq_number, sms_ctx.total_msgs);
-				goto done;
-			}
-			if (header->concatenated.seq_number == 1) {
-				sprintf(sms_ctx.concat_rsp_buf,
-					"\r\n#XSMS: \"%02d-%02d-%02d %02d:%02d:%02d\","
-					"\"%s\",\"%s",
-					header->time.year, header->time.month, header->time.day,
-					header->time.hour, header->time.minute,	header->time.second,
-					header->originating_address.address_str,
-					data->payload);
-			} else {
-				strcpy(sms_ctx.concat_rsp_buf + SM_SMS_AT_HEADER_INFO_MAX_LEN +
-				       (header->concatenated.seq_number - 1) *
-				       SMS_MAX_PAYLOAD_LEN_CHARS,
-				       data->payload);
-			}
-			sms_ctx.count++;
-			if (sms_ctx.count == sms_ctx.total_msgs) {
-				for (int i = 1; i < (sms_ctx.total_msgs); i++) {
-					strncat(sms_ctx.concat_rsp_buf,
-						sms_ctx.concat_rsp_buf + SM_SMS_AT_HEADER_INFO_MAX_LEN +
-						i * SMS_MAX_PAYLOAD_LEN_CHARS,
-						SMS_MAX_PAYLOAD_LEN_CHARS);
-				}
-				strcat(sms_ctx.concat_rsp_buf, "\"\r\n");
-				urc_send_to(sms_ctx.pipe, "%s", sms_ctx.concat_rsp_buf);
-			} else {
-				/* If new messages for the concatenated message are not receivied
-				 * within 3 minutes, discard the concatenated message.
-				 */
-				(void)k_work_reschedule(&sms_ctx.cleanup_work, MAX_CONCATENATED_MESSAGE_AGE);
-				return;
-			}
-done:
-			sms_concat_clear(&sms_ctx);
+			sms_concat_handle(data);
 		}
 	} else {
 		LOG_WRN("Unknown type: %d", data->type);
