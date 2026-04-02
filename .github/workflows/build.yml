@@ -118,8 +118,9 @@ jobs:
             fi
             (cd "$temp" && zip -q -r "$root/artifacts/${base}.zip" .)
 
+            cd ${src_dir}
+            find . -type f \( -name '*.elf' -o -name '*.dts' -o -name '.config' \) -exec zip -q -r "${root}/artifacts_extras/${base}_extras.zip" {} +
             cd ${root}
-            find ${src_dir} -type f \( -name '*.elf' -o -name '*.dts' -o -name '.config' \) -exec zip -q -r "${root}/artifacts_extras/${base}_extras.zip" {} +
 
             rm -rf "$temp"
           }
@@ -157,5 +158,6 @@ jobs:
         #if: ${{ inputs.trigger_source == 'release-workflow' }}
         uses: actions/upload-artifact@v4
         with:
+          name: artifact_extras
           path: |
             serial_modem/artifacts_extras/*
