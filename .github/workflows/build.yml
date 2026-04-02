@@ -71,7 +71,7 @@ jobs:
         run: ./nrfutil toolchain-manager install --toolchain-bundle ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
 
       - name: Build Serial Modem for PR
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
         run: |
           ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors --integration --exclude-tag exclude_integration
 
@@ -85,11 +85,12 @@ jobs:
         working-directory: serial_modem
         run: |
           mkdir -p artifacts
+          mkdir -p artifacts_extras
           VERSION=${{ github.event.release.tag_name || 'unknown-version' }}
           NRF9151DK_DIR=twister-out/nrf9151dk_nrf9151_ns/zephyr/serial_modem/app
           NRF54L15DK_DIR=twister-out/nrf54l15dk_nrf54l15_cpuapp/zephyr/serial_modem/samples
 
-          # Sysbuild release bundle: merged hex, Kconfig, signed images, elf, DFU zip → artifacts/${base}.zip
+          # Create release bundle: merged hex, Kconfig, signed images, elf, DFU zip → artifacts/${base}.zip
           zip_artifacts() {
             local app_build_dir="$1"
             local src_dir="$2"
@@ -107,16 +108,19 @@ jobs:
             #echo "root: ${root}"
             #pwd
 
-            cp "${root}/${src_dir}/merged.hex" "${temp}/${base}.hex"
-            cp "${root}/${src_dir}/${app_build_dir}/zephyr/.config" "${temp}/${base}.config"
-            cp "${root}/${src_dir}/${app_build_dir}/zephyr/zephyr.elf" "${temp}/${base}.elf"
-            cp "${root}/${src_dir}/${app_build_dir}/zephyr/zephyr.dts" "${temp}/${base}.dts"
+            cp "${src_dir}/merged.hex" "${temp}/${base}.hex"
+            cp "${src_dir}/${app_build_dir}/zephyr/.config" "${temp}/${base}.config"
+            cp "${src_dir}/${app_build_dir}/zephyr/zephyr.elf" "${temp}/${base}.elf"
+            cp "${src_dir}/${app_build_dir}/zephyr/zephyr.dts" "${temp}/${base}.dts"
             if [ -z "$host" ]; then
-              cp "${root}/${src_dir}/${app_build_dir}/zephyr/zephyr.signed.bin" "${temp}/${base}.signed.bin"
-              cp "${root}/${src_dir}/${app_build_dir}/zephyr/zephyr.signed.hex" "${temp}/${base}.signed.hex"
-              cp "${root}/${src_dir}/dfu_application.zip" "${temp}/${base}_dfu.zip"
+              cp "${src_dir}/${app_build_dir}/zephyr/zephyr.signed.bin" "${temp}/${base}.signed.bin"
+              cp "${src_dir}/dfu_application.zip" "${temp}/${base}_dfu.zip"
             fi
             (cd "$temp" && zip -q -r "$root/artifacts/${base}.zip" .)
+
+            cd ${root}
+            find ${src_dir} -type f \( -name '*.elf' -o -name '*.dts' -o -name '.config' \) -exec zip -q -r "${root}/artifacts_extras/${base}_extras.zip" {} +
+
             rm -rf "$temp"
           }
 
@@ -137,8 +141,21 @@ jobs:
           # nRF54L15 DK PPP shell build
           zip_artifacts "sm_ppp_shell" "${NRF54L15DK_DIR}/sm_ppp_shell/sample.sm_ppp_shell" "sm_ppp_shell_${VERSION}_nrf54l15dk" 1
 
+          pwd
+          ls -la
+          ls -la artifacts
+          ls -la artifacts_extras
+
       - name: Upload artifacts
         #if: ${{ inputs.trigger_source == 'release-workflow' }}
         uses: actions/upload-artifact@v4
         with:
-          path: serial_modem/artifacts/*
+          path: |
+            serial_modem/artifacts/*
+
+      - name: Upload artifacts extras
+        #if: ${{ inputs.trigger_source == 'release-workflow' }}
+        uses: actions/upload-artifact@v4
+        with:
+          path: |
+            serial_modem/artifacts_extras/*
