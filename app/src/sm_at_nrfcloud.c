@@ -193,7 +193,7 @@ static void nrfcloud_conn_work_fn(struct k_work *work)
 }
 
 SM_AT_CMD_CUSTOM(xnrfcloud, "AT#XNRFCLOUD", handle_at_nrf_cloud);
-static int handle_at_nrf_cloud(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
+STATIC int handle_at_nrf_cloud(enum at_parser_cmd_type cmd_type, struct at_parser *parser,
 			       uint32_t param_count)
 {
 	enum sm_nrfcloud_operation {
@@ -284,7 +284,7 @@ NRF_MODEM_LIB_ON_INIT(sm_nrfcloud_init_hook, sm_at_nrfcloud_init, NULL);
 #if defined(CONFIG_SM_NRF_CLOUD_LOCATION)
 
 SM_AT_CMD_CUSTOM(xnrfcloudpos, "AT#XNRFCLOUDPOS", handle_at_nrf_cloud_pos);
-static int handle_at_nrf_cloud_pos(enum at_parser_cmd_type cmd_type,
+STATIC int handle_at_nrf_cloud_pos(enum at_parser_cmd_type cmd_type,
 				   struct at_parser *parser, uint32_t param_count)
 {
 	int err;
@@ -647,9 +647,16 @@ end:
 	at_monitor_pause(&sm_ncellmeas);
 	if (err == 0) {
 		k_work_submit_to_queue(&sm_work_q, &nrfcloud_loc_req_work);
-	} else if (cell_data == NULL) {
-		/* If cell_data is not provided, cleanup the cell data in error cases */
-		nrfcloud_cell_data_cleanup();
+	} else {
+		if (cell_data == NULL) {
+			/* If cell_data is not provided, cleanup the cell data in error cases */
+			nrfcloud_cell_data_cleanup();
+		}
+		if (nrfcloud_wifi_pos) {
+			free(nrfcloud_wifi_data.ap_info);
+			nrfcloud_wifi_data.ap_info = NULL;
+		}
+		nrfcloud_sending_loc_req = false;
 	}
 	k_work_cancel_delayable(&ncellmeas_timeout_backup_work);
 }
@@ -690,6 +697,7 @@ static void nrfcloud_loc_req_work_fn(struct k_work *work)
 	nrfcloud_cell_data_cleanup();
 	if (nrfcloud_wifi_pos) {
 		free(nrfcloud_wifi_data.ap_info);
+		nrfcloud_wifi_data.ap_info = NULL;
 	}
 	nrfcloud_sending_loc_req = false;
 }
@@ -1014,6 +1022,11 @@ static int parse_ncellmeas_gci(const char *at_response, struct lte_lc_cells_info
 			 */
 			cells->current_cell = parsed_cell;
 			if (parsed_ncells_count != 0) {
+				/* Free any neighbor_cells allocated by a prior parse pass
+				 * (e.g. from NCELLMEAS=1) before overwriting the pointer.
+				 */
+				free(cells->neighbor_cells);
+				cells->neighbor_cells = NULL;
 				cells->neighbor_cells = parse_ncellmeas_neighbors(
 					&parser, parsed_ncells_count, &curr_index);
 				if (cells->neighbor_cells == NULL) {
