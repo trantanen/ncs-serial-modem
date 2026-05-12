@@ -355,7 +355,7 @@ Other changes
 
   * ``AT#XNRFCLOUDPOS``:
 
-    * Changed ``<cell_pos>`` parameter to ``<cell_count>``. The meaning changes from no cell positioning, single-cell or multi-cell to the number of cells to beincluded in the location request.
+    * Changed ``<cell_pos>`` parameter to ``<cell_count>``. The meaning changes from no cell positioning, single-cell or multi-cell to the number of cells to be included in the location request.
       ``0`` means that cellular positioning is not requested at all.
     * The ``AT#XNRFCLOUDPOS`` command has been updated to use the ``AT%NCELLMEAS`` command internally so the host must not use it anymore.
 

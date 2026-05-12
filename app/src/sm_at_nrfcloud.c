@@ -60,13 +60,15 @@ static bool nrfcloud_sending_loc_req;
 static uint8_t search_type;
 static uint8_t gci_count;
 
-static void nrfcloud_loc_req_work_fn(struct k_work *work);
 static void nrfcloud_conn_work_fn(struct k_work *work);
+static void nrfcloud_loc_req_work_fn(struct k_work *work);
+static void sm_at_nrfcloud_ncellmeas_work_fn(struct k_work *work);
 
-K_WORK_DEFINE(nrfcloud_loc_req_work, nrfcloud_loc_req_work_fn);
 K_WORK_DEFINE(nrfcloud_conn_work, nrfcloud_conn_work_fn);
+K_WORK_DEFINE(nrfcloud_loc_req_work, nrfcloud_loc_req_work_fn);
+K_WORK_DEFINE(sm_at_nrfcloud_ncellmeas_work, sm_at_nrfcloud_ncellmeas_work_fn);
 /* Signals completion of an AT%NCELLMEAS measurement (%NCELLMEAS URC). */
-K_SEM_DEFINE(scan_cellular_sem_ncellmeas_evt, 0, 1);
+K_SEM_DEFINE(ncellmeas_sem_ncellmeas_evt, 0, 1);
 
 /* Parameters saved before submitting connection work. */
 static bool nrfcloud_connect;
@@ -80,17 +82,10 @@ static struct lte_lc_cells_info *nrfcloud_cell_data;
 /* nRF Cloud location request Wi-Fi data. */
 static struct wifi_scan_info nrfcloud_wifi_data;
 
-/**
- * Waiting time (in seconds) of RRC connection going into idle mode. Because GCI search
- * cannot scan GCI cells during RRC connected mode, we will wait for the RRC idle mode before
- * initiating GCI search.
- */
-#define SCAN_CELLULAR_RRC_IDLE_WAIT_TIME 10
-
 static K_SEM_DEFINE(entered_rrc_idle, 1, 1);
 
-static void scan_cellular_timeout_backup_work_fn(struct k_work *work);
-K_WORK_DELAYABLE_DEFINE(scan_cellular_timeout_backup_work, scan_cellular_timeout_backup_work_fn);
+static void ncellmeas_timeout_backup_work_fn(struct k_work *work);
+K_WORK_DELAYABLE_DEFINE(ncellmeas_timeout_backup_work, ncellmeas_timeout_backup_work_fn);
 
 #endif /* CONFIG_SM_NRF_CLOUD_LOCATION */
 
@@ -415,7 +410,8 @@ static int handle_at_nrf_cloud_pos(enum at_parser_cmd_type cmd_type,
 
 	nrfcloud_sending_loc_req = true;
 	if (cell_count >= 1) {
-		scan_cellular_execute(cell_count, NULL);
+		/* To workqueue to avoid blocking the AT pipe and return OK */
+		k_work_submit_to_queue(&sm_work_q, &sm_at_nrfcloud_ncellmeas_work);
 	} else {
 		k_work_submit_to_queue(&sm_work_q, &nrfcloud_loc_req_work);
 	}
@@ -500,7 +496,7 @@ static int plmn_param_string_to_mcc_mnc(struct at_parser *parser, size_t idx, in
 
 AT_MONITOR(sm_ncellmeas, "NCELLMEAS", at_handler_ncellmeas, PAUSED);
 
-static void cleanup_nrfcloud_cell_data(void)
+static void nrfcloud_cell_data_cleanup(void)
 {
 	if (nrfcloud_cell_data == NULL) {
 		return;
@@ -514,11 +510,12 @@ static void cleanup_nrfcloud_cell_data(void)
 	nrfcloud_cell_data = NULL;
 }
 
-void scan_cellular_execute(uint8_t cell_count, struct lte_lc_cells_info *cell_data)
+void sm_at_nrfcloud_ncellmeas(uint8_t cell_count, struct lte_lc_cells_info *cell_data)
 {
 	int err;
 	uint8_t ncellmeas3_cell_count;
 	int rrc_mode;
+	struct lte_lc_cell *cells = NULL;
 
 	nrfcloud_cell_data = cell_data;
 	if (cell_data == NULL) {
@@ -536,7 +533,7 @@ void scan_cellular_execute(uint8_t cell_count, struct lte_lc_cells_info *cell_da
 	nrfcloud_cell_data->gci_cells_count = 0;
 
 	/* Start backup timeout for 120 seconds to handle missing NCELLMEAS notification. */
-	k_work_schedule(&scan_cellular_timeout_backup_work, K_SECONDS(120));
+	k_work_schedule(&ncellmeas_timeout_backup_work, K_SECONDS(120));
 	at_monitor_resume(&sm_ncellmeas);
 
 	LOG_DBG("Triggering cell measurements cell_count=%d", cell_count);
@@ -552,7 +549,7 @@ void scan_cellular_execute(uint8_t cell_count, struct lte_lc_cells_info *cell_da
 		LOG_ERR("Failed to initiate neighbor cell measurements: %d", err);
 		goto end;
 	}
-	err = k_sem_take(&scan_cellular_sem_ncellmeas_evt, K_FOREVER);
+	err = k_sem_take(&ncellmeas_sem_ncellmeas_evt, K_FOREVER);
 	if (err) {
 		/* Semaphore was reset so stop search procedure */
 		err = 0;
@@ -596,7 +593,7 @@ void scan_cellular_execute(uint8_t cell_count, struct lte_lc_cells_info *cell_da
 	LOG_DBG("GCI history search (NCELLMEAS=3,%d)", ncellmeas3_cell_count);
 
 	/* Allocate GCI cells structure */
-	struct lte_lc_cell *cells = calloc(ncellmeas3_cell_count, sizeof(struct lte_lc_cell));
+	cells = calloc(ncellmeas3_cell_count, sizeof(struct lte_lc_cell));
 	if (cells == NULL) {
 		LOG_ERR("Failed to allocate memory for the GCI cells");
 		goto end;
@@ -614,7 +611,7 @@ void scan_cellular_execute(uint8_t cell_count, struct lte_lc_cells_info *cell_da
 		err = 0;
 		goto end;
 	}
-	err = k_sem_take(&scan_cellular_sem_ncellmeas_evt, K_FOREVER);
+	err = k_sem_take(&ncellmeas_sem_ncellmeas_evt, K_FOREVER);
 	if (err) {
 		/* Semaphore was reset so stop search procedure */
 		err = 0;
@@ -644,7 +641,7 @@ void scan_cellular_execute(uint8_t cell_count, struct lte_lc_cells_info *cell_da
 		err = 0;
 		goto end;
 	}
-	k_sem_take(&scan_cellular_sem_ncellmeas_evt, K_FOREVER);
+	k_sem_take(&ncellmeas_sem_ncellmeas_evt, K_FOREVER);
 
 end:
 	at_monitor_pause(&sm_ncellmeas);
@@ -652,16 +649,23 @@ end:
 		k_work_submit_to_queue(&sm_work_q, &nrfcloud_loc_req_work);
 	} else if (cell_data == NULL) {
 		/* If cell_data is not provided, cleanup the cell data in error cases */
-		cleanup_nrfcloud_cell_data();
+		nrfcloud_cell_data_cleanup();
 	}
-	k_work_cancel_delayable(&scan_cellular_timeout_backup_work);
+	k_work_cancel_delayable(&ncellmeas_timeout_backup_work);
 }
 
-static void scan_cellular_timeout_backup_work_fn(struct k_work *work)
+static void sm_at_nrfcloud_ncellmeas_work_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	k_sem_reset(&scan_cellular_sem_ncellmeas_evt);
+	sm_at_nrfcloud_ncellmeas(nrfcloud_cell_count, nrfcloud_cell_data);
+}
+
+static void ncellmeas_timeout_backup_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	k_sem_reset(&ncellmeas_sem_ncellmeas_evt);
 }
 
 static void nrfcloud_loc_req_work_fn(struct k_work *work)
@@ -683,7 +687,7 @@ static void nrfcloud_loc_req_work_fn(struct k_work *work)
 		urc_send_to(nrfcloud_pipe, "\r\n#XNRFCLOUDPOS: %d\r\n", err < 0 ? -1 : err);
 	}
 
-	cleanup_nrfcloud_cell_data();
+	nrfcloud_cell_data_cleanup();
 	if (nrfcloud_wifi_pos) {
 		free(nrfcloud_wifi_data.ap_info);
 	}
@@ -818,7 +822,10 @@ static int parse_ncellmeas_gci(const char *at_response, struct lte_lc_cells_info
 	__ASSERT_NO_MSG(cells != NULL);
 	__ASSERT_NO_MSG(cells->gci_cells != NULL);
 
-	/* We don't want to clear old current cell or GCI cell info */
+	/* We don't want to clear old current cell since it's not always returned but
+	 * we want to overwrite old GCI cells.
+	 */
+	cells->gci_cells_count = 0;
 
 	/*
 	 * Response format for GCI search types:
@@ -1169,7 +1176,8 @@ static int parse_ncellmeas(const char *at_response, struct lte_lc_cells_info *ce
 		goto clean_exit;
 	}
 
-	cells->neighbor_cells = parse_ncellmeas_neighbors(&parser, cells->ncells_count, &curr_index);
+	cells->neighbor_cells = parse_ncellmeas_neighbors(
+		&parser, cells->ncells_count, &curr_index);
 	if (cells->neighbor_cells == NULL) {
 		LOG_ERR("Failed to parse neighbor cells");
 		err = -EFAULT;
@@ -1198,13 +1206,14 @@ static void at_handler_ncellmeas(const char *response)
 	switch (err) {
 	case 0: /* Fall through */
 	case 1:
-		LOG_DBG("NCELLMEAS parsed successfully, err: %d", err);
+		LOG_DBG("NCELLMEAS parsed successfully, err: %d, gci_count: %d, ncells_count: %d",
+			err, nrfcloud_cell_data->gci_cells_count, nrfcloud_cell_data->ncells_count);
 		break;
 	default:
 		LOG_ERR("NCELLMEAS parsing failed, err: %d", err);
 		break;
 	}
 
-	k_sem_give(&scan_cellular_sem_ncellmeas_evt);
+	k_sem_give(&ncellmeas_sem_ncellmeas_evt);
 }
 #endif /* CONFIG_SM_NRF_CLOUD_LOCATION */
