@@ -107,11 +107,13 @@ jobs:
             if [ -z "$host" ]; then
               cp "${src_dir}/${app_build_dir}/zephyr/zephyr.signed.bin" "${temp}/${base}.signed.bin"
               cp "${src_dir}/dfu_application.zip" "${temp}/${base}_dfu.zip"
+              cp "${src_dir}/signed_by_mcuboot_and_b0_mcuboot.bin" "${temp}/${base}_mcuboot_b0_s0_image.signed.bin"
+              cp "${src_dir}/signed_by_mcuboot_and_b0_s1_image.bin" "${temp}/${base}_mcuboot_b0_s1_image.signed.bin"
             fi
             (cd "$temp" && zip -q -r "$root/artifacts/${base}.zip" .)
 
             cd ${src_dir}
-            find . -type f \( -name '*.elf' -o -name '*.dts' -o -name '.config' \) -exec zip -q -r "${root}/artifacts_extras/${base}_extras.zip" {} +
+            find . -type f \( -name '*.elf' -o -name '*.dts' -o -name '.config' -o -name '*.bin' -o -name '*.hex' \) -exec zip -q -r "${root}/artifacts_extras/${base}_extras.zip" {} +
             cd ${root}
 
             rm -rf "$temp"
