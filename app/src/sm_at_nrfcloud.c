@@ -33,8 +33,6 @@ bool sm_nrf_cloud_send_location;
 
 /* NCELLMEAS notification parameters */
 #define AT_NCELLMEAS_STATUS_INDEX	     1
-#define AT_NCELLMEAS_STATUS_VALUE_FAIL	     1
-#define AT_NCELLMEAS_STATUS_VALUE_INCOMPLETE 2
 #define AT_NCELLMEAS_CELL_ID_INDEX	     2
 #define AT_NCELLMEAS_PLMN_INDEX		     3
 #define AT_NCELLMEAS_TAC_INDEX		     4
@@ -44,9 +42,13 @@ bool sm_nrf_cloud_send_location;
 #define AT_NCELLMEAS_RSRP_INDEX		     8
 #define AT_NCELLMEAS_RSRQ_INDEX		     9
 #define AT_NCELLMEAS_MEASUREMENT_TIME_INDEX  10
+
 #define AT_NCELLMEAS_PRE_NCELLS_PARAMS_COUNT 11
 #define AT_NCELLMEAS_NCELLS_PARAMS_COUNT     5
 #define AT_NCELLMEAS_GCI_CELL_PARAMS_COUNT   12
+
+#define AT_NCELLMEAS_STATUS_VALUE_FAIL	     1
+#define AT_NCELLMEAS_STATUS_VALUE_INCOMPLETE 2
 
 /* Whether cellular positioning is requested and if so, which. */
 static uint8_t nrfcloud_cell_count;
@@ -63,10 +65,13 @@ static uint8_t gci_count;
 static void nrfcloud_conn_work_fn(struct k_work *work);
 static void nrfcloud_loc_req_work_fn(struct k_work *work);
 static void sm_at_nrfcloud_ncellmeas_work_fn(struct k_work *work);
+static void ncellmeas_timeout_backup_work_fn(struct k_work *work);
 
 K_WORK_DEFINE(nrfcloud_conn_work, nrfcloud_conn_work_fn);
 K_WORK_DEFINE(nrfcloud_loc_req_work, nrfcloud_loc_req_work_fn);
 K_WORK_DEFINE(sm_at_nrfcloud_ncellmeas_work, sm_at_nrfcloud_ncellmeas_work_fn);
+K_WORK_DELAYABLE_DEFINE(ncellmeas_timeout_backup_work, ncellmeas_timeout_backup_work_fn);
+
 /* Signals completion of an AT%NCELLMEAS measurement (%NCELLMEAS URC). */
 K_SEM_DEFINE(ncellmeas_sem_ncellmeas_evt, 0, 1);
 
@@ -81,11 +86,6 @@ static struct lte_lc_cells_info *nrfcloud_cell_data;
 
 /* nRF Cloud location request Wi-Fi data. */
 static struct wifi_scan_info nrfcloud_wifi_data;
-
-static K_SEM_DEFINE(entered_rrc_idle, 1, 1);
-
-static void ncellmeas_timeout_backup_work_fn(struct k_work *work);
-K_WORK_DELAYABLE_DEFINE(ncellmeas_timeout_backup_work, ncellmeas_timeout_backup_work_fn);
 
 #endif /* CONFIG_SM_NRF_CLOUD_LOCATION */
 
@@ -334,6 +334,11 @@ STATIC int handle_at_nrf_cloud_pos(enum at_parser_cmd_type cmd_type,
 		return -E2BIG;
 	}
 
+	if (wifi_pos && param_count < WIFI_APS_BEGIN_IDX + 1) {
+		/* Wi-Fi AP required if Wi-Fi positioning. */
+		return -ENOENT;
+	}
+
 	if (wifi_pos) {
 		nrfcloud_wifi_data.ap_info = malloc(
 			sizeof(*nrfcloud_wifi_data.ap_info) * (param_count - WIFI_APS_BEGIN_IDX));
@@ -400,7 +405,7 @@ STATIC int handle_at_nrf_cloud_pos(enum at_parser_cmd_type cmd_type,
 				nrfcloud_wifi_data.cnt, NRF_CLOUD_LOCATION_WIFI_AP_CNT_MIN);
 		}
 		if (err) {
-			k_free(nrfcloud_wifi_data.ap_info);
+			free(nrfcloud_wifi_data.ap_info);
 			return err;
 		}
 	}
@@ -410,7 +415,7 @@ STATIC int handle_at_nrf_cloud_pos(enum at_parser_cmd_type cmd_type,
 
 	nrfcloud_sending_loc_req = true;
 	if (cell_count >= 1) {
-		/* To workqueue to avoid blocking the AT pipe and return OK */
+		/* To workqueue to be able to send OK response */
 		k_work_submit_to_queue(&sm_work_q, &sm_at_nrfcloud_ncellmeas_work);
 	} else {
 		k_work_submit_to_queue(&sm_work_q, &nrfcloud_loc_req_work);
@@ -746,22 +751,20 @@ static struct lte_lc_ncell *parse_ncellmeas_neighbors(
 	int tmp_int = 0;
 	size_t j = 0;
 
-	if (ncell_count != 0) {
-		/* Allocate room for the parsed neighbor info. */
-		ncells = calloc(ncell_count, sizeof(struct lte_lc_ncell));
-		if (ncells == NULL) {
-			LOG_ERR("OOM: ncells");
-			return NULL;
-		}
-	} else {
+	if (ncell_count == 0) {
+		return NULL;
+	}
+	/* Allocate room for the parsed neighbor info. */
+	ncells = calloc(ncell_count, sizeof(struct lte_lc_ncell));
+	if (ncells == NULL) {
+		LOG_ERR("OOM: ncells");
 		return NULL;
 	}
 
 	/* Parse neighbors */
 	for (j = 0; j < ncell_count; j++) {
 		/* <n_earfcn[j]> */
-		(*curr_index)++;
-		err = at_parser_num_get(parser, *curr_index, &ncells->earfcn);
+		err = at_parser_num_get(parser, *curr_index, &ncells[j].earfcn);
 		if (err) {
 			LOG_ERR("Could not parse n_earfcn, error: %d", err);
 			goto error_exit;
@@ -769,7 +772,7 @@ static struct lte_lc_ncell *parse_ncellmeas_neighbors(
 
 		/* <n_phys_cell_id[j]> */
 		(*curr_index)++;
-		err = at_parser_num_get(parser, *curr_index, &ncells->phys_cell_id);
+		err = at_parser_num_get(parser, *curr_index, &ncells[j].phys_cell_id);
 		if (err) {
 			LOG_ERR("Could not parse n_phys_cell_id, error: %d", err);
 			goto error_exit;
@@ -782,7 +785,7 @@ static struct lte_lc_ncell *parse_ncellmeas_neighbors(
 			LOG_ERR("Could not parse n_rsrp, error: %d", err);
 			goto error_exit;
 		}
-		ncells->rsrp = tmp_int;
+		ncells[j].rsrp = tmp_int;
 
 		/* <n_rsrq[j]> */
 		(*curr_index)++;
@@ -791,15 +794,16 @@ static struct lte_lc_ncell *parse_ncellmeas_neighbors(
 			LOG_ERR("Could not parse n_rsrq, error: %d", err);
 			goto error_exit;
 		}
-		ncells->rsrq = tmp_int;
+		ncells[j].rsrq = tmp_int;
 
 		/* <time_diff[j]> */
 		(*curr_index)++;
-		err = at_parser_num_get(parser, *curr_index, &ncells->time_diff);
+		err = at_parser_num_get(parser, *curr_index, &ncells[j].time_diff);
 		if (err) {
 			LOG_ERR("Could not parse time_diff, error: %d", err);
 			goto error_exit;
 		}
+		(*curr_index)++;
 	}
 
 	return ncells;
@@ -878,8 +882,8 @@ static int parse_ncellmeas_gci(const char *at_response, struct lte_lc_cells_info
 	}
 
 	/* Go through the cells */
-	for (i = 0;
-	     curr_index < (param_count - (AT_NCELLMEAS_GCI_CELL_PARAMS_COUNT + 1)) && i < gci_count;
+	for (i = 0; curr_index < (param_count - (AT_NCELLMEAS_GCI_CELL_PARAMS_COUNT + 1)) &&
+		    i < gci_count;
 	     i++) {
 		struct lte_lc_cell parsed_cell;
 		bool is_serving_cell;
@@ -1051,7 +1055,7 @@ static int parse_ncellmeas(const char *at_response, struct lte_lc_cells_info *ce
 	int err, status, tmp;
 	struct at_parser parser;
 	size_t count = 0;
-	int curr_index = AT_NCELLMEAS_PRE_NCELLS_PARAMS_COUNT;
+	int ncells_start_idx = AT_NCELLMEAS_PRE_NCELLS_PARAMS_COUNT;
 
 	__ASSERT_NO_MSG(at_response != NULL);
 	__ASSERT_NO_MSG(cells != NULL);
@@ -1169,9 +1173,7 @@ static int parse_ncellmeas(const char *at_response, struct lte_lc_cells_info *ce
 	/* Neighbor cell count */
 	cells->ncells_count = neighborcell_count_get(at_response);
 
-	/* Starting from modem firmware v1.3.1, timing advance measurement time
-	 * information is added as the last parameter in the response.
-	 */
+	/* Timing advance measurement time is added as the last parameter in the response. */
 	size_t ta_meas_time_index = AT_NCELLMEAS_PRE_NCELLS_PARAMS_COUNT +
 				    cells->ncells_count * AT_NCELLMEAS_NCELLS_PARAMS_COUNT;
 
@@ -1190,7 +1192,7 @@ static int parse_ncellmeas(const char *at_response, struct lte_lc_cells_info *ce
 	}
 
 	cells->neighbor_cells = parse_ncellmeas_neighbors(
-		&parser, cells->ncells_count, &curr_index);
+		&parser, cells->ncells_count, &ncells_start_idx);
 	if (cells->neighbor_cells == NULL) {
 		LOG_ERR("Failed to parse neighbor cells");
 		err = -EFAULT;
