@@ -29,7 +29,12 @@ static char nrfcloud_device_id[NRF_CLOUD_CLIENT_ID_MAX_LEN];
 bool sm_nrf_cloud_ready;
 bool sm_nrf_cloud_send_location;
 
+static void nrfcloud_conn_work_fn(struct k_work *work);
+K_WORK_DEFINE(nrfcloud_conn_work, nrfcloud_conn_work_fn);
+
 #if defined(CONFIG_SM_NRF_CLOUD_LOCATION)
+
+#define NRFCLOUDPOS_TIMEOUT_SEC 120
 
 /* NCELLMEAS notification parameters */
 #define AT_NCELLMEAS_STATUS_INDEX	     1
@@ -59,15 +64,13 @@ static bool nrfcloud_wifi_pos;
 /* Whether a location request is currently being sent to nRF Cloud. */
 static bool nrfcloud_sending_loc_req;
 
-static uint8_t search_type;
-static uint8_t gci_count;
+static uint8_t ncellmeas_search_type;
+static uint8_t ncellmeas_gci_count;
 
-static void nrfcloud_conn_work_fn(struct k_work *work);
 static void nrfcloud_loc_req_work_fn(struct k_work *work);
 static void sm_at_nrfcloud_ncellmeas_work_fn(struct k_work *work);
 static void ncellmeas_timeout_backup_work_fn(struct k_work *work);
 
-K_WORK_DEFINE(nrfcloud_conn_work, nrfcloud_conn_work_fn);
 K_WORK_DEFINE(nrfcloud_loc_req_work, nrfcloud_loc_req_work_fn);
 K_WORK_DEFINE(sm_at_nrfcloud_ncellmeas_work, sm_at_nrfcloud_ncellmeas_work_fn);
 K_WORK_DELAYABLE_DEFINE(ncellmeas_timeout_backup_work, ncellmeas_timeout_backup_work_fn);
@@ -265,7 +268,6 @@ static void sm_at_nrfcloud_init(int ret, void *ctx)
 	if (initialized) {
 		return;
 	}
-	initialized = true;
 
 	err = nrf_cloud_coap_init();
 	if (err) {
@@ -273,7 +275,13 @@ static void sm_at_nrfcloud_init(int ret, void *ctx)
 		return;
 	}
 
-	nrf_cloud_client_id_get(nrfcloud_device_id, sizeof(nrfcloud_device_id));
+	err = nrf_cloud_client_id_get(nrfcloud_device_id, sizeof(nrfcloud_device_id));
+	if (err) {
+		LOG_ERR("Failed to get nRF Cloud client ID: %d", err);
+		return;
+	}
+
+	initialized = true;
 }
 NRF_MODEM_LIB_ON_INIT(sm_nrfcloud_init_hook, sm_at_nrfcloud_init, NULL);
 
@@ -538,7 +546,7 @@ void sm_at_nrfcloud_ncellmeas(uint8_t cell_count, struct lte_lc_cells_info *cell
 	nrfcloud_cell_data->gci_cells_count = 0;
 
 	/* Start backup timeout for 120 seconds to handle missing NCELLMEAS notification. */
-	k_work_schedule(&ncellmeas_timeout_backup_work, K_SECONDS(120));
+	k_work_schedule(&ncellmeas_timeout_backup_work, K_SECONDS(NRFCLOUDPOS_TIMEOUT_SEC));
 	at_monitor_resume(&sm_ncellmeas);
 
 	LOG_DBG("Triggering cell measurements cell_count=%d", cell_count);
@@ -548,13 +556,13 @@ void sm_at_nrfcloud_ncellmeas(uint8_t cell_count, struct lte_lc_cells_info *cell
 	 *      In addition neighbor cells are received.
 	 */
 	LOG_DBG("Normal neighbor search (NCELLMEAS=1)");
-	search_type = 1;
+	ncellmeas_search_type = 1;
 	err = sm_util_at_printf("AT%%NCELLMEAS=1");
 	if (err) {
 		LOG_ERR("Failed to initiate neighbor cell measurements: %d", err);
 		goto end;
 	}
-	err = k_sem_take(&ncellmeas_sem_ncellmeas_evt, K_FOREVER);
+	err = k_sem_take(&ncellmeas_sem_ncellmeas_evt, K_SECONDS(NRFCLOUDPOS_TIMEOUT_SEC));
 	if (err) {
 		/* Semaphore was reset so stop search procedure */
 		err = 0;
@@ -588,7 +596,6 @@ void sm_at_nrfcloud_ncellmeas(uint8_t cell_count, struct lte_lc_cells_info *cell
 		}
 	}
 
-
 	/*****
 	 * 2nd: GCI history search to get GCI cells we can quickly search and measure.
 	 *      Because history search is quick and very power efficient, we request
@@ -605,8 +612,8 @@ void sm_at_nrfcloud_ncellmeas(uint8_t cell_count, struct lte_lc_cells_info *cell
 	}
 	nrfcloud_cell_data->gci_cells = cells;
 
-	search_type = 3;
-	gci_count = ncellmeas3_cell_count;
+	ncellmeas_search_type = 3;
+	ncellmeas_gci_count = ncellmeas3_cell_count;
 	err = sm_util_at_printf("AT%%NCELLMEAS=3,%d", ncellmeas3_cell_count);
 	if (err) {
 		LOG_WRN("Failed to initiate GCI cell measurements: %d", err);
@@ -616,7 +623,7 @@ void sm_at_nrfcloud_ncellmeas(uint8_t cell_count, struct lte_lc_cells_info *cell
 		err = 0;
 		goto end;
 	}
-	err = k_sem_take(&ncellmeas_sem_ncellmeas_evt, K_FOREVER);
+	err = k_sem_take(&ncellmeas_sem_ncellmeas_evt, K_SECONDS(NRFCLOUDPOS_TIMEOUT_SEC));
 	if (err) {
 		/* Semaphore was reset so stop search procedure */
 		err = 0;
@@ -635,8 +642,8 @@ void sm_at_nrfcloud_ncellmeas(uint8_t cell_count, struct lte_lc_cells_info *cell
 	 */
 	LOG_DBG("GCI regional search (NCELLMEAS=4,%d)", cell_count);
 
-	search_type = 4;
-	gci_count = cell_count;
+	ncellmeas_search_type = 4;
+	ncellmeas_gci_count = cell_count;
 	err = sm_util_at_printf("AT%%NCELLMEAS=4,%d", cell_count);
 	if (err) {
 		LOG_WRN("Failed to initiate GCI cell measurements: %d", err);
@@ -646,7 +653,7 @@ void sm_at_nrfcloud_ncellmeas(uint8_t cell_count, struct lte_lc_cells_info *cell
 		err = 0;
 		goto end;
 	}
-	k_sem_take(&ncellmeas_sem_ncellmeas_evt, K_FOREVER);
+	k_sem_take(&ncellmeas_sem_ncellmeas_evt, K_SECONDS(NRFCLOUDPOS_TIMEOUT_SEC));
 
 end:
 	at_monitor_pause(&sm_ncellmeas);
@@ -688,7 +695,11 @@ static void nrfcloud_loc_req_work_fn(struct k_work *work)
 	const struct nrf_cloud_rest_location_request request = {
 		.config = NULL,
 		.cell_info = nrfcloud_cell_count ? nrfcloud_cell_data : NULL,
-		.wifi_info = nrfcloud_wifi_pos ? &nrfcloud_wifi_data : NULL};
+		.wifi_info = nrfcloud_wifi_pos ? &nrfcloud_wifi_data : NULL
+	};
+
+	// TODO: Check if we ncellmeas failed and no wifi aps.
+	//urc_send_to(nrfcloud_pipe, "\r\n#XNRFCLOUDPOS: -1\r\n");
 
 	err = nrf_cloud_coap_location_get(&request, &result);
 	if (err == 0) {
@@ -883,7 +894,7 @@ static int parse_ncellmeas_gci(const char *at_response, struct lte_lc_cells_info
 
 	/* Go through the cells */
 	for (i = 0; curr_index < (param_count - (AT_NCELLMEAS_GCI_CELL_PARAMS_COUNT + 1)) &&
-		    i < gci_count;
+		    i < ncellmeas_gci_count;
 	     i++) {
 		struct lte_lc_cell parsed_cell;
 		bool is_serving_cell;
@@ -1021,7 +1032,7 @@ static int parse_ncellmeas_gci(const char *at_response, struct lte_lc_cells_info
 		if (is_serving_cell) {
 			/* This the current/serving cell.
 			 * In practice the <neighbor_count> is always 0 for other than
-			 * the serving cell, i.e. no neigbour cell list is available.
+			 * the serving cell, i.e. no neigbor cell list is available.
 			 * Thus, handle neighbor cells only for the serving cell.
 			 */
 			cells->current_cell = parsed_cell;
@@ -1213,7 +1224,7 @@ static void at_handler_ncellmeas(const char *response)
 		return;
 	}
 
-	if (search_type > 2) {
+	if (ncellmeas_search_type > 2) {
 		err = parse_ncellmeas_gci(response, nrfcloud_cell_data);
 	} else {
 		err = parse_ncellmeas(response, nrfcloud_cell_data);
@@ -1231,4 +1242,5 @@ static void at_handler_ncellmeas(const char *response)
 
 	k_sem_give(&ncellmeas_sem_ncellmeas_evt);
 }
+
 #endif /* CONFIG_SM_NRF_CLOUD_LOCATION */

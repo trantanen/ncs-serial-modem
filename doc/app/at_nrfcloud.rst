@@ -203,6 +203,7 @@ Syntax
 
      Since the |SM| uses the ``AT%NCELLMEAS`` command internally, the host must not use the ``AT%NCELLMEAS`` command during ``#XNRFCLOUDPOS`` command execution.
      You may still use ``AT%NCELLMEAS`` command before or after ``#XNRFCLOUDPOS`` command execution for your own purposes.
+     You will also see ``%NCELLMEAS`` notifications, which you can ignore, during the ``#XNRFCLOUDPOS`` command execution.
 
 * The ``<wifi_pos>`` parameter can have the following integer values:
 
@@ -269,14 +270,16 @@ Example
   OK
 
   #XNRFCLOUDPOS: 0,35.455833,139.626111,1094
-  AT%NCELLMEAS
+
+  AT#XNRFCLOUDPOS=5,0
 
   OK
 
   %NCELLMEAS: 0,"0199F10A","44020","107E",65535,3750,5,49,27,107504,3750,251,33,4,0,475,107,26,14,25,475,58,26,17,25,475,277,24,9,25,475,51,18,1,25
-  AT#XNRFCLOUDPOS=2,0
 
-  OK
+  %NCELLMEAS: 0,"01234567","44020","0340",50,175456,3400,34,5,24,1775066,1,0,"00143FAE","44020","0140",65535,0,6200,47,40,14,1775066,0,0
+
+  %NCELLMEAS: 0,"00987654","44020","0240",50,1754746,5500,44,4,4,1463457,1,0,"002F4344","44020","0140",65535,0,6200,47,40,14,1775066,0,0,"001C0502","44013","5A00",65535,0,6400,130,29,18,1775124,0,0,"00136107","44013","5A00",65535,0,3600,202,26,13,234533,0,0
 
   #XNRFCLOUDPOS: 1,35.455833,139.626111,1094
   AT#XNRFCLOUDPOS=0,1,"40:9b:cd:c1:5a:40","00:90:fe:eb:4f:42"

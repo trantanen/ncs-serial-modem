@@ -25,7 +25,7 @@ extern bool sm_nrf_cloud_send_location;
  * @brief Execute cellular neighbor cell measurements.
  *
  * @param[in] cell_count Number of cells to search for.
- * @param[in] cell_data Cell data structure to be filled.
+ * @param[in,out] cell_data Cell data structure to be filled.
  *            NULL means that the function will allocate the memory.
  */
 void sm_at_nrfcloud_ncellmeas(uint8_t cell_count, struct lte_lc_cells_info *cell_data);
