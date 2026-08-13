@@ -9,6 +9,7 @@ tests:
       - EXTRA_DTC_OVERLAY_FILE="nrf91m1.overlay;trace-backend.overlay"
     extra_configs:
       - CONFIG_SM_LOG_LEVEL_DBG=y
+      # tasta poistettiin
     platform_allow:
       - nrf9151dk/nrf9151/ns
   # The nRF91M1 configuration is the one that carries the most Kconfig fragments and
