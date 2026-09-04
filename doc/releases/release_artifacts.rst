@@ -12,14 +12,6 @@ The following release artifacts are available:
      - Description
    * - ``serial_modem_{VERSION}_nrf9151dk_nrf91m1``
      - nRF91M1 content for nRF9151 DK.
-   * - ``serial_modem_{VERSION}_nrf9151dk_normal``
-     - Normal build for nRF9151 DK, including PPP and CMUX support to operate with PC.
-   * - ``serial_modem_{VERSION}_nrf9151dk_normal_mtrace``
-     - Normal build with modem traces and application debug logging enabled for nRF9151 DK to operate with PC.
-   * - ``serial_modem_{VERSION}_nrf9151dk_extmcu``
-     - External MCU build for nRF9151 DK, including PPP and CMUX support.
-   * - ``serial_modem_{VERSION}_nrf9151dk_extmcu_mtrace``
-     - External MCU build with modem traces and application debug logging enabled for nRF9151 DK.
    * - ``sm_at_client_shell_{VERSION}_nrf54l15dk``
      - AT client shell build for nRF54L15 DK host that can be used as an external MCU with ``serial_modem_{VERSION}_nrf9151dk_extmcu``.
        See :ref:`uart_configuration` for pin wiring.
