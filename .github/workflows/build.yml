@@ -121,7 +121,7 @@ jobs:
       - name: Build Serial Modem nightly
         if: ${{ github.event_name == 'schedule' || inputs.trigger_source == 'release-workflow' || github.event_name == 'workflow_dispatch' }}
         run: |
-          ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors --all
+          ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors -s serial_modem.nrf91m1
 
       - name: Zip build artifacts
         if: ${{ inputs.trigger_source == 'release-workflow' || github.event_name == 'workflow_dispatch' }}
