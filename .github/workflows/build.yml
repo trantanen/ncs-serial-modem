@@ -121,7 +121,7 @@ jobs:
       - name: Build Serial Modem nightly
         if: ${{ github.event_name == 'schedule' || inputs.trigger_source == 'release-workflow' || github.event_name == 'workflow_dispatch' }}
         run: |
-          ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors -s serial_modem.nrf91m1
+          ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors -s sample.sm_at_client_shell
 
       - name: Zip build artifacts
         if: ${{ inputs.trigger_source == 'release-workflow' || github.event_name == 'workflow_dispatch' }}
@@ -166,11 +166,11 @@ jobs:
             rm -rf "$temp"
           }
 
-          # nRF9151 DK builds for nRF91M1
-          zip_artifacts "app" "${NRF9151DK_DIR}/serial_modem.nrf91m1" "serial_modem_${VERSION}_nrf9151dk_nrf91m1" 0 "merged_nrf9151dk.hex" "app"
-
           # nRF54L15 DK AT client shell build
           zip_artifacts "sm_at_client_shell" "${NRF54L15DK_DIR}/sm_at_client_shell/sample.sm_at_client_shell" "sm_at_client_shell_${VERSION}_nrf54l15dk" 1 "merged_nrf54l15dk.hex" "samples/sm_at_client_shell"
+
+          # nRF9151 DK builds for nRF91M1
+          zip_artifacts "app" "${NRF9151DK_DIR}/serial_modem.nrf91m1" "serial_modem_${VERSION}_nrf9151dk_nrf91m1" 0 "merged_nrf9151dk.hex" "app"
 
           # nRF54L15 DK PPP shell build
           zip_artifacts "sm_ppp_shell" "${NRF54L15DK_DIR}/sm_ppp_shell/sample.sm_ppp_shell" "sm_ppp_shell_${VERSION}_nrf54l15dk" 1 "merged_nrf54l15dk.hex" "samples/sm_ppp_shell"
