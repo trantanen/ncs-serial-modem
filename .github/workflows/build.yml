@@ -126,8 +126,15 @@ jobs:
 
       - name: Build Serial Modem nightly
         if: ${{ github.event_name == 'schedule' || inputs.trigger_source == 'release-workflow' || github.event_name == 'workflow_dispatch' }}
+        # TEMPORARY: build only the configurations packed by "Zip build artifacts"
+        # to speed up release asset generation. Restore the original command
+        # (without -s/-p, with --all) before merging.
         run: |
-          ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors --all
+          ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors \
+            -p nrf9151dk/nrf9151/ns -p nrf54l15dk/nrf54l15/cpuapp \
+            -s serial_modem.nrf91m1 \
+            -s sample.sm_at_client_shell \
+            -s sample.sm_ppp_shell
 
       - name: Zip build artifacts
         if: ${{ inputs.trigger_source == 'release-workflow' || github.event_name == 'workflow_dispatch' }}
@@ -173,10 +180,10 @@ jobs:
           zip_artifacts "app" "${NRF9151DK_DIR}/serial_modem.nrf91m1" "serial_modem_${VERSION}_nrf9151dk_nrf91m1" 0 "merged_nrf9151dk.hex" "app"
 
           # nRF9151-MK-BG95 interposer build
-          zip_artifacts "app" "${NRF9151DK_DIR}/serial_modem.interposer_nrf9151_mk_bg95" "serial_modem_${VERSION}_interposer_nrf9151_mk_bg95_nrf91m1" 0 "merged_nrf9151dk.hex" "app"
+          #zip_artifacts "app" "${NRF9151DK_DIR}/serial_modem.interposer_nrf9151_mk_bg95" "serial_modem_${VERSION}_interposer_nrf9151_mk_bg95_nrf91m1" 0 "merged_nrf9151dk.hex" "app"
 
           # nRF9151-MK-GM02S interposer build
-          zip_artifacts "app" "${NRF9151DK_DIR}/serial_modem.interposer_nrf9151_mk_gm02s" "serial_modem_${VERSION}_interposer_nrf9151_mk_gm02s_nrf91m1" 0 "merged_nrf9151dk.hex" "app"
+          #zip_artifacts "app" "${NRF9151DK_DIR}/serial_modem.interposer_nrf9151_mk_gm02s" "serial_modem_${VERSION}_interposer_nrf9151_mk_gm02s_nrf91m1" 0 "merged_nrf9151dk.hex" "app"
 
           # nRF54L15 DK AT client shell build
           zip_artifacts "sm_at_client_shell" "${NRF54L15DK_DIR}/sm_at_client_shell/sample.sm_at_client_shell" "sm_at_client_shell_${VERSION}_nrf54l15dk" 1 "merged_nrf54l15dk.hex" "samples/sm_at_client_shell"
